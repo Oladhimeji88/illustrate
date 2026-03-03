@@ -15,6 +15,10 @@ const CLOUDFLARE_MODEL = process.env.CLOUDFLARE_MODEL ?? "@cf/stabilityai/stable
 const HF_MODEL = process.env.HF_MODEL ?? "stabilityai/stable-diffusion-xl-base-1.0";
 const HEX_COLOR = /^#(?:[0-9a-fA-F]{3}){1,2}$/;
 
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 function isInList<T extends readonly string[]>(value: string, list: T): value is T[number] {
   return (list as readonly string[]).includes(value);
 }
@@ -25,30 +29,35 @@ function fail(error: string, status = 400) {
 }
 
 function parsePayload(input: unknown): GenerateRequestBody | null {
-  if (!input || typeof input !== "object") return null;
+  if (!isObjectRecord(input)) return null;
 
-  const candidate = input as Partial<GenerateRequestBody>;
-  if (typeof candidate.prompt !== "string" || !candidate.prompt.trim()) return null;
-  if (!candidate.illustrationType || !isInList(candidate.illustrationType, ILLUSTRATION_TYPES)) return null;
-  if (!candidate.style || !isInList(candidate.style, STYLE_OPTIONS)) return null;
-  if (!candidate.complexity || !isInList(candidate.complexity, COMPLEXITY_OPTIONS)) return null;
-  if (!candidate.output || !isInList(candidate.output, OUTPUT_OPTIONS)) return null;
-  if (!candidate.palette) return null;
+  const prompt = typeof input.prompt === "string" ? input.prompt.trim().slice(0, 240) : "";
+  if (!prompt) return null;
 
-  const { palette } = candidate;
-  if (!HEX_COLOR.test(palette.primary) || !HEX_COLOR.test(palette.secondary) || !HEX_COLOR.test(palette.accent)) return null;
+  if (typeof input.illustrationType !== "string" || !isInList(input.illustrationType, ILLUSTRATION_TYPES)) return null;
+  if (typeof input.style !== "string" || !isInList(input.style, STYLE_OPTIONS)) return null;
+  if (typeof input.complexity !== "string" || !isInList(input.complexity, COMPLEXITY_OPTIONS)) return null;
+  if (typeof input.output !== "string" || !isInList(input.output, OUTPUT_OPTIONS)) return null;
+
+  const palette = input.palette;
+  if (!isObjectRecord(palette)) return null;
+
+  const primary = typeof palette.primary === "string" ? palette.primary : "";
+  const secondary = typeof palette.secondary === "string" ? palette.secondary : "";
+  const accent = typeof palette.accent === "string" ? palette.accent : "";
+  if (!HEX_COLOR.test(primary) || !HEX_COLOR.test(secondary) || !HEX_COLOR.test(accent)) return null;
 
   return {
-    prompt: candidate.prompt.trim().slice(0, 240),
-    illustrationType: candidate.illustrationType,
-    style: candidate.style,
-    complexity: candidate.complexity,
-    output: candidate.output,
-    forceMock: Boolean(candidate.forceMock),
+    prompt,
+    illustrationType: input.illustrationType,
+    style: input.style,
+    complexity: input.complexity,
+    output: input.output,
+    forceMock: Boolean(input.forceMock),
     palette: {
-      primary: palette.primary,
-      secondary: palette.secondary,
-      accent: palette.accent,
+      primary,
+      secondary,
+      accent,
       monochrome: Boolean(palette.monochrome),
     },
   };
@@ -86,6 +95,20 @@ async function tryCloudflareImage(prompt: string): Promise<string | null> {
   });
 
   return fetchBinaryAsDataUrl(response);
+}
+
+function buildProviderPrompt(payload: GenerateRequestBody): string {
+  const paletteSummary = payload.palette.monochrome
+    ? `monochrome ${payload.palette.primary}`
+    : `${payload.palette.primary}, ${payload.palette.secondary}, ${payload.palette.accent}`;
+
+  return [
+    `Create a ${payload.style} ${payload.illustrationType} illustration.`,
+    `Subject: ${payload.prompt}.`,
+    `Complexity: ${payload.complexity}.`,
+    `Color palette: ${paletteSummary}.`,
+    "Clean composition, no text, high visual contrast.",
+  ].join(" ");
 }
 
 async function tryHfImage(prompt: string): Promise<string | null> {
@@ -131,7 +154,8 @@ export async function POST(request: NextRequest) {
 
   try {
     if (!parsed.forceMock && parsed.output === "png") {
-      const cloudflareResult = await tryCloudflareImage(parsed.prompt);
+      const providerPrompt = buildProviderPrompt(parsed);
+      const cloudflareResult = await tryCloudflareImage(providerPrompt);
       if (cloudflareResult) {
         const response: GenerateSuccess = {
           ok: true,
@@ -141,7 +165,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json<GenerateResponse>(response);
       }
 
-      const hfResult = await tryHfImage(parsed.prompt);
+      const hfResult = await tryHfImage(providerPrompt);
       if (hfResult) {
         const response: GenerateSuccess = {
           ok: true,
