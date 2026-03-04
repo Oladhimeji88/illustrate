@@ -25,6 +25,7 @@ export type GenerateRequestBody = {
   complexity: ComplexityOption;
   palette: Palette;
   output: OutputOption;
+  sourceImageDataUrl?: string;
   forceMock?: boolean;
 };
 
@@ -52,7 +53,7 @@ export type HistoryItem = {
   palette: Palette;
   mode: "cloudflare" | "hf" | "mock";
   output: OutputOption;
+  sourceImageDataUrl?: string;
   svg?: string;
   pngDataUrl?: string;
 };
-

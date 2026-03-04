@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ChangeEvent, type FormEvent } from "react";
 import {
   COMPLEXITY_OPTIONS,
   ILLUSTRATION_TYPES,
@@ -23,9 +23,12 @@ type IllustrateLabAppProps = {
 };
 
 const HISTORY_LIMIT = 8;
+const MAX_SOURCE_IMAGE_BYTES = 4 * 1024 * 1024;
 
 export default function IllustrateLabApp({ providerStatus }: IllustrateLabAppProps) {
   const [prompt, setPrompt] = useState("A cheerful robot watering houseplants");
+  const [sourceImageDataUrl, setSourceImageDataUrl] = useState<string | null>(null);
+  const [sourceImageName, setSourceImageName] = useState<string | null>(null);
   const [illustrationType, setIllustrationType] = useState<(typeof ILLUSTRATION_TYPES)[number]>(ILLUSTRATION_TYPES[1]);
   const [style, setStyle] = useState<(typeof STYLE_OPTIONS)[number]>(STYLE_OPTIONS[0]);
   const [complexity, setComplexity] = useState<(typeof COMPLEXITY_OPTIONS)[number]>(COMPLEXITY_OPTIONS[1]);
@@ -49,9 +52,10 @@ export default function IllustrateLabApp({ providerStatus }: IllustrateLabAppPro
   }, [providerStatus]);
 
   const canUseProviders = providerStatus.cloudflare || providerStatus.huggingFace;
+  const hasResult = Boolean(result?.pngDataUrl || result?.svg);
 
   const currentPayload = (): GenerateRequestBody => ({
-    prompt,
+    prompt: prompt.trim() || `Restyle this image as ${style} ${illustrationType}`,
     illustrationType,
     style,
     complexity,
@@ -62,13 +66,45 @@ export default function IllustrateLabApp({ providerStatus }: IllustrateLabAppPro
       monochrome,
     },
     output,
+    sourceImageDataUrl: sourceImageDataUrl ?? undefined,
     forceMock,
   });
 
-  const onGenerate = async (event: React.FormEvent) => {
+  const onSourceImageChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      setError("Upload a valid image file.");
+      return;
+    }
+
+    if (file.size > MAX_SOURCE_IMAGE_BYTES) {
+      setError("Image is too large. Maximum size is 4MB.");
+      return;
+    }
+
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      setSourceImageDataUrl(dataUrl);
+      setSourceImageName(file.name);
+      setOutput("png");
+      setError(null);
+    } catch {
+      setError("Failed to read the uploaded image.");
+    }
+  };
+
+  const clearSourceImage = () => {
+    setSourceImageDataUrl(null);
+    setSourceImageName(null);
+  };
+
+  const onGenerate = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!prompt.trim()) {
-      setError("Prompt is required.");
+    if (!prompt.trim() && !sourceImageDataUrl) {
+      setError("Prompt is required unless you upload a source image.");
       return;
     }
 
@@ -103,6 +139,7 @@ export default function IllustrateLabApp({ providerStatus }: IllustrateLabAppPro
         palette: payload.palette,
         mode: data.mode,
         output: payload.output,
+        sourceImageDataUrl: payload.sourceImageDataUrl,
         svg: data.svg,
         pngDataUrl: data.pngDataUrl,
       };
@@ -125,6 +162,8 @@ export default function IllustrateLabApp({ providerStatus }: IllustrateLabAppPro
     setSecondary(entry.palette.secondary);
     setAccent(entry.palette.accent);
     setMonochrome(entry.palette.monochrome);
+    setSourceImageDataUrl(entry.sourceImageDataUrl ?? null);
+    setSourceImageName(entry.sourceImageDataUrl ? "history-image" : null);
     setResult({
       ok: true,
       mode: entry.mode,
@@ -134,13 +173,66 @@ export default function IllustrateLabApp({ providerStatus }: IllustrateLabAppPro
     setError(null);
   };
 
+  const onDownloadPng = async () => {
+    if (!result) return;
+
+    try {
+      setError(null);
+      const fileName = createDownloadName("png");
+
+      if (result.pngDataUrl) {
+        const pngDataUrl = result.pngDataUrl.startsWith("data:image/png")
+          ? result.pngDataUrl
+          : await imageToPngDataUrl(result.pngDataUrl);
+        triggerDownload(pngDataUrl, fileName);
+        return;
+      }
+
+      if (result.svg) {
+        const pngDataUrl = await svgMarkupToPngDataUrl(result.svg);
+        triggerDownload(pngDataUrl, fileName);
+        return;
+      }
+
+      setError("No illustration available to download.");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Failed to download PNG.";
+      setError(message);
+    }
+  };
+
+  const onDownloadSvg = async () => {
+    if (!result) return;
+
+    try {
+      setError(null);
+      const fileName = createDownloadName("svg");
+
+      if (result.svg) {
+        downloadTextAsFile(result.svg, "image/svg+xml;charset=utf-8", fileName);
+        return;
+      }
+
+      if (result.pngDataUrl) {
+        const wrappedSvg = await rasterDataUrlToSvgMarkup(result.pngDataUrl);
+        downloadTextAsFile(wrappedSvg, "image/svg+xml;charset=utf-8", fileName);
+        return;
+      }
+
+      setError("No illustration available to download.");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Failed to download SVG.";
+      setError(message);
+    }
+  };
+
   return (
     <main className="min-h-screen px-4 py-8 sm:px-6 lg:px-10">
       <div className="mx-auto grid w-full max-w-7xl gap-6 lg:grid-cols-[minmax(320px,420px)_1fr]">
         <section className="rounded-2xl border border-border bg-panel p-5 shadow-panel sm:p-6">
           <h1 className="text-2xl font-semibold tracking-tight">IllustrateLab</h1>
           <p className="mt-2 text-sm text-textMuted">
-            Generate editable illustration concepts quickly, then reuse your best runs from local history.
+            Generate illustration concepts from text or upload an image to create styled variants from the same art.
           </p>
           <div className="mt-4 rounded-xl border border-border bg-panelMuted px-3 py-2 text-xs text-textMuted">
             Providers: <span className="text-text">{providerText}</span>
@@ -152,9 +244,30 @@ export default function IllustrateLabApp({ providerStatus }: IllustrateLabAppPro
                 className="h-24 w-full resize-y rounded-lg border border-border bg-black/20 px-3 py-2"
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
-                placeholder="A concise description of the scene"
+                placeholder="Scene prompt or style instruction for uploaded image"
               />
             </label>
+
+            <div className="rounded-lg border border-border bg-black/20 p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-textMuted">Source image (optional)</span>
+                {sourceImageDataUrl ? (
+                  <button type="button" onClick={clearSourceImage} className="text-xs text-textMuted transition hover:text-text">
+                    Remove
+                  </button>
+                ) : null}
+              </div>
+              <input type="file" accept="image/*" onChange={onSourceImageChange} className="mt-2 block w-full text-sm file:mr-3 file:rounded-md file:border-0 file:bg-white file:px-3 file:py-1.5 file:text-black" />
+              <p className="mt-2 text-xs text-textMuted">
+                Upload once, then generate style variations from the same composition (similar to Whisk workflow).
+              </p>
+              {sourceImageDataUrl ? (
+                <div className="mt-3 overflow-hidden rounded-lg border border-border">
+                  <img src={sourceImageDataUrl} alt="Source artwork" className="h-40 w-full object-cover" />
+                  <p className="truncate border-t border-border bg-panelMuted px-2 py-1 text-xs text-textMuted">{sourceImageName ?? "source-image"}</p>
+                </div>
+              ) : null}
+            </div>
 
             <div className="grid gap-3 sm:grid-cols-2">
               <SelectField
@@ -208,10 +321,37 @@ export default function IllustrateLabApp({ providerStatus }: IllustrateLabAppPro
         </section>
 
         <section className="space-y-6">
+          {sourceImageDataUrl ? (
+            <div className="rounded-2xl border border-border bg-panel p-4 shadow-panel sm:p-5">
+              <h2 className="text-lg font-semibold">Source</h2>
+              <div className="mt-3 overflow-hidden rounded-xl border border-border bg-black/25 p-3">
+                <img src={sourceImageDataUrl} alt="Source upload" className="mx-auto max-h-[340px] w-full rounded-lg object-contain" />
+              </div>
+            </div>
+          ) : null}
+
           <div className="rounded-2xl border border-border bg-panel p-4 shadow-panel sm:p-5">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold">Preview</h2>
-              <span className="text-xs uppercase tracking-wide text-textMuted">{result?.mode ?? "idle"}</span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onDownloadPng}
+                  disabled={!hasResult || loading}
+                  className="rounded-md border border-border px-2.5 py-1 text-xs text-textMuted transition hover:border-white/35 hover:text-text disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  Download PNG
+                </button>
+                <button
+                  type="button"
+                  onClick={onDownloadSvg}
+                  disabled={!hasResult || loading}
+                  className="rounded-md border border-border px-2.5 py-1 text-xs text-textMuted transition hover:border-white/35 hover:text-text disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  Download SVG
+                </button>
+                <span className="text-xs uppercase tracking-wide text-textMuted">{result?.mode ?? "idle"}</span>
+              </div>
             </div>
             <div className="mt-4 rounded-xl border border-border bg-black/25 p-3">
               {result?.pngDataUrl ? (
@@ -239,7 +379,8 @@ export default function IllustrateLabApp({ providerStatus }: IllustrateLabAppPro
                     >
                       <p className="line-clamp-1 text-sm">{entry.prompt}</p>
                       <p className="mt-1 text-xs text-textMuted">
-                        {entry.style} | {entry.illustrationType} | {new Date(entry.timestamp).toLocaleTimeString()}
+                        {entry.style} | {entry.illustrationType} | {entry.sourceImageDataUrl ? "img2img" : "text2img"} |{" "}
+                        {new Date(entry.timestamp).toLocaleTimeString()}
                       </p>
                     </button>
                   </li>
@@ -307,4 +448,98 @@ function ColorField({ label, value, onChange }: ColorFieldProps) {
       </div>
     </label>
   );
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("Invalid file payload"));
+      }
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function createDownloadName(extension: "png" | "svg"): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `illustratelab-${stamp}.${extension}`;
+}
+
+function triggerDownload(url: string, filename: string, revokeAfter = false) {
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  if (revokeAfter) {
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+}
+
+function downloadTextAsFile(content: string, mimeType: string, filename: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const objectUrl = URL.createObjectURL(blob);
+  triggerDownload(objectUrl, filename, true);
+}
+
+function escapeXmlAttribute(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function loadImageElement(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Unable to load illustration image."));
+    image.src = src;
+  });
+}
+
+async function imageToPngDataUrl(imageSource: string): Promise<string> {
+  const image = await loadImageElement(imageSource);
+  const width = image.naturalWidth || image.width || 1024;
+  const height = image.naturalHeight || image.height || 1024;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Canvas context unavailable.");
+
+  context.drawImage(image, 0, 0, width, height);
+  return canvas.toDataURL("image/png");
+}
+
+async function svgMarkupToPngDataUrl(svgMarkup: string): Promise<string> {
+  const blob = new Blob([svgMarkup], { type: "image/svg+xml;charset=utf-8" });
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    return await imageToPngDataUrl(objectUrl);
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function rasterDataUrlToSvgMarkup(imageDataUrl: string): Promise<string> {
+  const image = await loadImageElement(imageDataUrl);
+  const width = image.naturalWidth || image.width || 1024;
+  const height = image.naturalHeight || image.height || 1024;
+  const safeHref = escapeXmlAttribute(imageDataUrl);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">
+  <image href="${safeHref}" x="0" y="0" width="${width}" height="${height}" preserveAspectRatio="xMidYMid meet" />
+</svg>`;
 }
